@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import argparse
 import os
 import sys
+import pickle
 import requests
 import xmltodict
 from six.moves import queue as Queue
@@ -20,7 +22,7 @@ RETRY = 5
 START = 0
 
 # Numbers of photos/videos per page
-MEDIA_NUM = 50
+MEDIA_NUM = 200
 
 # Numbers of downloading threads concurrently
 THREADS = 10
@@ -142,11 +144,29 @@ class DownloadWorker(Thread):
 
 class CrawlerScheduler(object):
 
-    def __init__(self, sites, proxies=None):
+    def __init__(self, sites, pickle_file, download_folder, verbose=False, proxies=None):
         self.sites = sites
+        self.pickle_file = pickle_file
+        self.pickle_data = None
+        self.verbose = verbose
+        self.regex_rules = [video_hd_match(), video_default_match()]
+        self.download_folder = download_folder or os.getcwd()
         self.proxies = proxies
+        self.read_pickle()
         self.queue = Queue.Queue()
         self.scheduling()
+        self.write_pickle()
+
+    def read_pickle(self):
+        if os.path.exists(self.pickle_file):
+            with open(self.pickle_file, 'rb') as fp:
+                self.pickle_data = pickle.load(fp)
+        else:
+            self.pickle_data = {'dirs': dict()}
+
+    def write_pickle(self):
+        with open(self.pickle_file, 'wb') as fp:
+            pickle.dump(self.pickle_data, fp)
 
     def scheduling(self):
         # create workers
@@ -162,8 +182,9 @@ class CrawlerScheduler(object):
             self.download_media(site)
 
     def download_media(self, site):
-        self.download_photos(site)
-        self.download_videos(site)
+        if site and site[0] != '#':
+            self.download_photos(site)
+            self.download_videos(site)
 
     def download_videos(self, site):
         self._download_media(site, "video", START)
@@ -180,8 +201,7 @@ class CrawlerScheduler(object):
         print("Finish Downloading All the photos from %s" % site)
 
     def _download_media(self, site, medium_type, start):
-        current_folder = os.getcwd()
-        target_folder = os.path.join(current_folder, site)
+        target_folder = os.path.join(self.download_folder, site)
         if not os.path.isdir(target_folder):
             os.mkdir(target_folder)
 
@@ -189,6 +209,8 @@ class CrawlerScheduler(object):
         start = START
         while True:
             media_url = base_url.format(site, medium_type, MEDIA_NUM, start)
+            if self.verbose:
+                print("parsing: " + media_url)
             response = requests.get(media_url,
                                     proxies=self.proxies)
             if response.status_code == 404:
@@ -205,11 +227,11 @@ class CrawlerScheduler(object):
                         # if post has photoset, walk into photoset for each photo
                         photoset = post["photoset"]["photo"]
                         for photo in photoset:
-                            self.queue.put((medium_type, photo, target_folder))
+                            self._enqueue(medium_type, photo, target_folder)
                     except:
                         # select the largest resolution
                         # usually in the first element
-                        self.queue.put((medium_type, post, target_folder))
+                        self._enqueue(medium_type, post, target_folder)
                 start += MEDIA_NUM
             except KeyError:
                 break
@@ -219,6 +241,54 @@ class CrawlerScheduler(object):
             except:
                 print("Unknown xml-vulnerabilities from URL %s" % media_url)
                 continue
+
+    def _enqueue(self, medium_type, photo, target_folder):
+        # filter to avoid load previously loaded data
+        filename = self._media_to_filename(medium_type, photo)
+        if not filename:
+            return
+        if target_folder not in self.pickle_data['dirs']:
+            self.pickle_data['dirs'][target_folder] = {'files': set()}
+        if filename not in self.pickle_data['dirs'][target_folder]['files']:
+            self.pickle_data['dirs'][target_folder]['files'].add(filename)
+            self.queue.put((medium_type, photo, target_folder))
+
+    def _media_to_filename(self, medium_type, post):
+
+        def _handle_medium_url(regex_rules, medium_type, post):
+            try:
+                if medium_type == "photo":
+                    return post["photo-url"][0]["#text"]
+
+                if medium_type == "video":
+                    video_player = post["video-player"][1]["#text"]
+                    for regex_rule in regex_rules:
+                        matched_url = regex_rule(video_player)
+                        if matched_url is not None:
+                            return matched_url
+                    else:
+                        raise Exception
+            except:
+                raise TypeError("Unable to find the right url for downloading. "
+                                "Please open a new issue on "
+                                "https://github.com/dixudx/tumblr-crawler/"
+                                "issues/new attached with below information:\n\n"
+                                "%s" % post)
+
+        def medium_url_to_name(medium_url):
+            medium_name = medium_url.split("/")[-1].split("?")[0]
+            if medium_type == "video":
+                if not medium_name.startswith("tumblr"):
+                    medium_name = "_".join([medium_url.split("/")[-2],
+                                            medium_name])
+
+                medium_name += ".mp4"
+            return medium_name
+
+        try:
+            return medium_url_to_name(_handle_medium_url(self.regex_rules, medium_type, post))
+        except:
+            return None
 
 
 def usage():
@@ -265,13 +335,19 @@ def parse_sites(filename):
 
 
 if __name__ == "__main__":
-    cur_dir = os.path.dirname(os.path.realpath(__file__))
     sites = None
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbose", action="store_true", default=False, help="increase output verbosity")
+    parser.add_argument("-p", "--pickle", help="pickle file path")
+    parser.add_argument("-d", "--directory", required=True, help="output root directory path")
+    parser.add_argument("-s", "--sites", required=True, help="filename that contains list "
+                                                             "of url tumblr prefixes (sites.txt)")
+    args = parser.parse_args()
+
     proxies = None
-    proxy_path = os.path.join(cur_dir, "proxies.json")
-    if os.path.exists(proxy_path):
-        with open(proxy_path, "r") as fj:
+    if os.path.exists("./proxies.json"):
+        with open("./proxies.json", "r") as fj:
             try:
                 proxies = json.load(fj)
                 if proxies is not None and len(proxies) > 0:
@@ -280,19 +356,16 @@ if __name__ == "__main__":
                 illegal_json()
                 sys.exit(1)
 
-    if len(sys.argv) < 2:
-        # check the sites file
-        filename = os.path.join(cur_dir, "sites.txt")
-        if os.path.exists(filename):
-            sites = parse_sites(filename)
-        else:
-            usage()
-            sys.exit(1)
+    # check the sites file
+    if os.path.exists(args.sites):
+        sites = parse_sites(args.sites)
     else:
-        sites = sys.argv[1].split(",")
+        usage()
+        sys.exit(1)
 
     if len(sites) == 0 or sites[0] == "":
         usage()
         sys.exit(1)
 
-    CrawlerScheduler(sites, proxies=proxies)
+    CrawlerScheduler(sites=sites, pickle_file=args.pickle,
+                     download_folder=args.directory, verbose=args.verbose, proxies=proxies)
